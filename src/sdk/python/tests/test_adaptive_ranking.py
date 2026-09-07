@@ -98,6 +98,29 @@ async def test_a_query_with_no_evidence_is_unaffected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_two_concurrent_sessions_do_not_cross_pair_with_turn_id() -> None:
+    # The multi-session bug this fixes end to end: session A searches, then
+    # session B's search would clobber a single unkeyed pending slot, then A
+    # invokes -- without turn_id the graph would wrongly learn B's query ->
+    # A's tool. Distinct turn_ids keep each session's pairing exact.
+    catalog = await build_catalog()
+    graph = IntentGraph()
+    catalog.experimental_enable_adaptive_ranking(graph)
+
+    catalog.search("why is the build broken", 5, turn_id="session-a")
+    catalog.search("read a file from disk", 5, turn_id="session-b")
+    await catalog.invoke("gh_run_list", {}, turn_id="session-a")
+    await catalog.invoke("read_file", {}, turn_id="session-b")
+
+    wire = json.loads(graph.to_json())
+    assert len(wire["intents"]) == 2
+    a = next(i for i in wire["intents"] if "why is the build broken" in i["members"])
+    b = next(i for i in wire["intents"] if "read a file from disk" in i["members"])
+    assert list(a["tools"].keys()) == ["gh_run_list"]
+    assert list(b["tools"].keys()) == ["read_file"]
+
+
+@pytest.mark.asyncio
 async def test_learning_survives_a_restart_via_the_wire_form() -> None:
     """The graph is in memory, so this is how a restart keeps what was learned."""
     first = await build_catalog()

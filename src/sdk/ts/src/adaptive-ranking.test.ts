@@ -79,6 +79,30 @@ describe("adaptive usage ranking", () => {
     expect(order.indexOf("gh_run_list")).toBeLessThan(order.indexOf("docker_build"));
   });
 
+  it("does not cross-pair two concurrent sessions sharing one catalog when turnId is supplied", async () => {
+    // The multi-session bug this fixes end to end: session A searches, then
+    // session B's search would clobber a single unkeyed pending slot, then A
+    // invokes — without turnId the graph would wrongly learn B's query -> A's
+    // tool. Distinct turnIds keep each session's pairing exact.
+    const catalog = await buildCatalog();
+    const graph = new IntentGraph();
+    catalog.experimentalEnableAdaptiveRanking(graph);
+
+    catalog.search("why is the build broken", 5, "direct", undefined, "session-a");
+    catalog.search("read a file from disk", 5, "direct", undefined, "session-b");
+    await catalog.invoke("gh_run_list", {}, undefined, "session-a");
+    await catalog.invoke("read_file", {}, undefined, "session-b");
+
+    const wire = JSON.parse(graph.toJson()) as {
+      intents: { members: string[]; tools: Record<string, number> }[];
+    };
+    expect(wire.intents).toHaveLength(2);
+    const a = wire.intents.find((i) => i.members.includes("why is the build broken"));
+    const b = wire.intents.find((i) => i.members.includes("read a file from disk"));
+    expect(Object.keys(a?.tools ?? {})).toEqual(["gh_run_list"]);
+    expect(Object.keys(b?.tools ?? {})).toEqual(["read_file"]);
+  });
+
   it("does not disturb a query it has no evidence about", async () => {
     const baseline = ids((await buildCatalog()).search("read a file from disk", 5));
 
