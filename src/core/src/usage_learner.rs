@@ -11,8 +11,15 @@
 //! learner needs no new plumbing — it decorates whatever sink is already
 //! installed and forwards every event untouched.
 //!
-//! **One learner per session.** Two sessions sharing one learner would cross-pair
-//! their searches and invokes and record edges nobody produced.
+//! **Pairing is keyed by `turn_id`.** [`crate::trace::TraceEventContext::turn_id`]
+//! is a caller-supplied id correlating one logical turn's search with the
+//! invoke(s) that confirm it — distinct from the trace-*stream* `session_id`
+//! fixed at sink construction. A learner shared by multiple concurrent
+//! sessions stays correct as long as each supplies its own `turn_id`. A
+//! caller that never supplies one shares the reserved sentinel slot
+//! ([`crate::usage::NO_TURN`]), reproducing the original single-slot
+//! behavior — including its cross-session collisions — as the accepted cost
+//! of opting out.
 //!
 //! # What counts as evidence
 //!
@@ -42,21 +49,67 @@
 //! [`IntentGraph::arm`] picks the tier from what the graph carries, so either
 //! kind works on every [`crate::SearchMethod`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::trace::{Origin, TraceEnvelope, TraceEvent, TraceEventContext, TraceSink};
-use crate::usage::{Capability, IntentGraph, Observation};
+use crate::usage::{Capability, IntentGraph, NO_TURN, Observation};
 
-/// The learner's most recent search — the query an invoke attributes to. Kept
-/// per-learner (not read from the shared graph) so a concurrent search from
-/// another session cannot misattribute this learner's invoke. Whether the
+/// Cap on concurrently-pending turn keys. Bounds memory from turns that search
+/// and never invoke; eviction is FIFO by first-touch, mirroring
+/// [`crate::usage`]'s own `PENDING_CAP`/`BoundedMap` posture (kept as an
+/// independent constant/type here since the two live in different modules and
+/// hold different value shapes).
+const PENDING_CAP: usize = 256;
+
+/// The most recent search per pending turn — the query an invoke under that
+/// turn attributes to. Kept per-learner (not read from the shared graph) so a
+/// concurrent search under a *different* `turn_id`, from another session
+/// sharing this learner, cannot misattribute this turn's invoke. Whether the
 /// question has already been credited a support bump lives on the shared graph
 /// ([`IntentGraph::claim_credit`]), so per-catalog tool and skill learners count
 /// one fanned-out question once between them, not once each.
 struct Pending {
     query: String,
+}
+
+/// Bounded, [`NO_TURN`]-keyed pending map behind [`UsageLearner::pending`].
+/// FIFO-evicts the longest-pending turn key once [`PENDING_CAP`] is exceeded.
+#[derive(Default)]
+struct PendingMap {
+    slots: HashMap<String, Pending>,
+    order: VecDeque<String>,
+}
+
+impl PendingMap {
+    /// Record `query` as the pending search for `turn_key`, replacing whatever
+    /// was pending under that same key.
+    fn remember(&mut self, turn_key: &str, query: &str) {
+        if !self.slots.contains_key(turn_key) {
+            self.order.push_back(turn_key.to_string());
+            while self.slots.len() >= PENDING_CAP {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.slots.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.slots.insert(
+            turn_key.to_string(),
+            Pending {
+                query: query.to_string(),
+            },
+        );
+    }
+
+    /// The query pending under `turn_key`, without clearing it — several
+    /// invokes may follow one search under the same turn, and each needs to
+    /// see it.
+    fn query_for(&self, turn_key: &str) -> Option<String> {
+        self.slots.get(turn_key).map(|p| p.query.clone())
+    }
 }
 
 /// Which searches may open an observation window.
@@ -139,8 +192,8 @@ impl ObservationPolicy {
 /// What one trace event means for learning, under a policy.
 ///
 /// **The pairing rule, in one place.** The live path and the replay path differ
-/// in where they keep pending state — a per-session learner holds a `Mutex`
-/// slot, a replay holds a map keyed by `session_id` — but they must agree
+/// in which id keys their pending-state map — the live path by `turn_id`, a
+/// replay by `session_id` (see [`replay_log_into`]) — but they must agree
 /// exactly on *which event does what*, or a graph built from a log stops
 /// matching the one live learning would have grown from the same events. Having
 /// written that match twice, a later change (a new confirming event, a pairing
@@ -238,13 +291,17 @@ pub(crate) fn replay_log_into(
         // it an observation; later ones add edges for the same question.
         let first_confirmation = !entry.1;
         entry.1 = true;
-        // Stash this query's vector right before the observation reads it. The
-        // slot holds one entry, so with sessions interleaved anything set
-        // earlier may belong to another session's question.
+        // Stash this query's vector right before the observation reads it,
+        // under the shared NO_TURN key: replay walks the log sequentially, one
+        // envelope at a time, so nothing else can clobber it between the set
+        // and this same iteration's read — unlike the live path, replay needs
+        // no turn keying here (it already keys credit/pending by `session` in
+        // the map above, for its own reason: log interleaving).
         if let (Some(vector), Some(fp)) = (embeddings.get(query), fingerprint) {
-            graph.note_query_vector(query, vector, fp);
+            graph.note_query_vector(NO_TURN, query, vector, fp);
         }
         graph.observe(Observation {
+            turn_key: NO_TURN,
             query,
             kind,
             capability_id,
@@ -319,8 +376,10 @@ fn accepts(policy: ObservationPolicy, origin: Origin) -> bool {
 pub struct UsageLearner {
     inner: Arc<dyn TraceSink>,
     graph: Arc<RwLock<IntentGraph>>,
-    /// The session's most recent search, awaiting an invoke to confirm it.
-    pending: Mutex<Option<Pending>>,
+    /// The most recent search per pending turn, awaiting an invoke to confirm
+    /// it. Keyed by `turn_id` (see the module doc); callers that never supply
+    /// one share [`crate::usage::NO_TURN`].
+    pending: Mutex<PendingMap>,
     policy: ObservationPolicy,
 }
 
@@ -343,7 +402,7 @@ impl UsageLearner {
         Self {
             inner,
             graph,
-            pending: Mutex::new(None),
+            pending: Mutex::new(PendingMap::default()),
             policy,
         }
     }
@@ -367,27 +426,25 @@ impl UsageLearner {
     /// its own learner — the previous per-learner flag credited once *each*.
     /// Over-counting still needs a credit, then another search of the same text,
     /// then another credit — two real searches, which should count twice.
-    fn remember_query(&self, query: &str) {
+    fn remember_query(&self, turn_key: &str, query: &str) {
         if let Ok(mut pending) = self.pending.lock() {
-            *pending = Some(Pending {
-                query: query.to_string(),
-            });
+            pending.remember(turn_key, query);
         }
         if let Ok(graph) = self.graph.read() {
-            graph.arm_credit(query);
+            graph.arm_credit(turn_key, query);
         }
     }
 
-    /// Pair `capability_id` with the pending query, if there is one.
+    /// Pair `capability_id` with the query pending under `turn_key`, if any.
     ///
     /// Best-effort throughout: trace events are observations, so a poisoned lock
     /// or a missing pending query drops the evidence rather than disturbing the
     /// agent loop (ADR-0007's query-log semantics).
-    fn confirm(&self, kind: Capability, capability_id: &str, ts_ms: u64) {
+    fn confirm(&self, turn_key: &str, kind: Capability, capability_id: &str, ts_ms: u64) {
         let Ok(pending) = self.pending.lock() else {
             return;
         };
-        let Some(query) = pending.as_ref().map(|p| p.query.clone()) else {
+        let Some(query) = pending.query_for(turn_key) else {
             return; // an invoke with no search before it proves nothing
         };
         drop(pending);
@@ -395,8 +452,9 @@ impl UsageLearner {
             // The first invoke of this question, across every learner sharing the
             // graph, is what makes it an observation; the rest add edges for the
             // same question without re-bumping support.
-            let first_confirmation = graph.claim_credit(&query);
+            let first_confirmation = graph.claim_credit(turn_key, &query);
             graph.observe(Observation {
+                turn_key,
                 query: &query,
                 kind,
                 capability_id,
@@ -419,11 +477,12 @@ impl UsageLearner {
     /// Does **not** forward to the inner sink: replaying an old log must not
     /// re-emit its events into a live stream.
     ///
-    /// One learner covers one session. Feed envelopes from different
-    /// `session_id`s through separate learners, or their searches and invokes
-    /// cross-pair into edges nobody produced.
+    /// One learner may serve multiple concurrent sessions as long as each
+    /// supplies its own `turn_id` (see the module doc); envelopes carry
+    /// `turn_id` themselves, so no extra plumbing is needed here.
     pub fn replay(&self, envelope: &TraceEnvelope) {
-        self.learn_from(&envelope.event, envelope.ts);
+        let turn_key = envelope.turn_id.as_deref().unwrap_or(NO_TURN);
+        self.learn_from(&envelope.event, envelope.ts, turn_key);
     }
 
     /// The shared pairing step behind [`Self::replay`] and [`TraceSink::record`].
@@ -432,10 +491,12 @@ impl UsageLearner {
     /// cleared**. Clearing would let one of Ratel's own internal searches,
     /// landing between a captured query and its invokes, silently discard the
     /// turn's evidence.
-    fn learn_from(&self, event: &TraceEvent, ts_ms: u64) {
+    fn learn_from(&self, event: &TraceEvent, ts_ms: u64, turn_key: &str) {
         match classify(event, self.policy) {
-            Step::Remember(query) => self.remember_query(query),
-            Step::Confirm(kind, capability_id) => self.confirm(kind, capability_id, ts_ms),
+            Step::Remember(query) => self.remember_query(turn_key, query),
+            Step::Confirm(kind, capability_id) => {
+                self.confirm(turn_key, kind, capability_id, ts_ms)
+            }
             Step::Ignore => {}
         }
     }
@@ -443,17 +504,19 @@ impl UsageLearner {
 
 impl TraceSink for UsageLearner {
     fn record(&self, event: TraceEvent) {
-        self.learn_from(&event, now_ms());
+        self.learn_from(&event, now_ms(), NO_TURN);
         self.inner.record(event);
     }
 
     fn record_with_context(&self, event: TraceEvent, context: TraceEventContext) {
-        self.learn_from(&event, now_ms());
+        let turn_key = context.turn_id.as_deref().unwrap_or(NO_TURN);
+        self.learn_from(&event, now_ms(), turn_key);
         self.inner.record_with_context(event, context);
     }
 
     fn record_envelope(&self, envelope: TraceEnvelope) {
-        self.learn_from(&envelope.event, envelope.ts);
+        let turn_key = envelope.turn_id.as_deref().unwrap_or(NO_TURN);
+        self.learn_from(&envelope.event, envelope.ts, turn_key);
         self.inner.record_envelope(envelope);
     }
 
@@ -684,6 +747,114 @@ mod tests {
                 .members
                 .contains(&"rotate the signing key".to_string())
         );
+    }
+
+    // ---- turn_id: multi-session pairing -------------------------------
+
+    fn search_with_turn(query: &str, turn_id: &str) -> (TraceEvent, TraceEventContext) {
+        (
+            search(query),
+            TraceEventContext {
+                turn_id: Some(turn_id.into()),
+                ..TraceEventContext::default()
+            },
+        )
+    }
+
+    fn invoke_with_turn(tool_id: &str, turn_id: &str) -> (TraceEvent, TraceEventContext) {
+        (
+            invoke(tool_id),
+            TraceEventContext {
+                turn_id: Some(turn_id.into()),
+                ..TraceEventContext::default()
+            },
+        )
+    }
+
+    #[test]
+    fn two_concurrent_sessions_with_turn_ids_do_not_cross_pair() {
+        // The exact bug this module fixes: one learner (e.g. one ToolCatalog's
+        // IntentGraph shared by two agent sessions) sees session A's search,
+        // then session B's search overwrites the pending slot, then A invokes —
+        // without turn_id, the graph would wrongly learn B's query -> A's tool.
+        let (l, graph) = learner();
+        let (e, c) = search_with_turn("delete a stale branch", "session-a");
+        l.record_with_context(e, c);
+        let (e, c) = search_with_turn("rotate the signing key", "session-b");
+        l.record_with_context(e, c);
+        let (e, c) = invoke_with_turn("git_branch_delete", "session-a");
+        l.record_with_context(e, c);
+        let (e, c) = invoke_with_turn("vault_rotate", "session-b");
+        l.record_with_context(e, c);
+
+        let g = graph.read().unwrap();
+        assert_eq!(g.len(), 2, "two distinct questions, two clusters");
+        let a = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"delete a stale branch".to_string()))
+            .expect("session A's query should have its own cluster");
+        assert_eq!(
+            a.tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete"],
+            "session A's invoke must pair with session A's search, not B's"
+        );
+        let b = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"rotate the signing key".to_string()))
+            .expect("session B's query should have its own cluster");
+        assert_eq!(
+            b.tools.keys().collect::<Vec<_>>(),
+            vec!["vault_rotate"],
+            "session B's invoke must pair with session B's search, not A's"
+        );
+    }
+
+    #[test]
+    fn no_turn_id_reproduces_todays_single_slot_pairing_exactly() {
+        // The backward-compat proof: the same interleaving, with no turn_id on
+        // either side, keeps the pre-turn_id single-slot behavior byte for
+        // byte, cross-session collision included.
+        let (l, graph) = learner();
+        l.record(search("delete a stale branch"));
+        l.record(search("rotate the signing key"));
+        l.record(invoke("git_branch_delete"));
+        l.record(invoke("vault_rotate"));
+
+        let g = graph.read().unwrap();
+        assert_eq!(g.len(), 1, "only the later query was pending");
+        assert!(
+            g.intents[0]
+                .members
+                .contains(&"rotate the signing key".to_string())
+        );
+        assert_eq!(
+            g.intents[0].tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete", "vault_rotate"],
+            "both invokes cross-paired onto the one pending query, as before"
+        );
+    }
+
+    #[test]
+    fn pending_map_evicts_oldest_past_pending_cap() {
+        let (l, graph) = learner();
+        for i in 0..PENDING_CAP + 10 {
+            let turn_id = format!("turn-{i}");
+            let (e, c) = search_with_turn("some query", &turn_id);
+            l.record_with_context(e, c);
+        }
+        // The oldest turns were evicted, so their invokes now find nothing
+        // pending and teach the graph nothing.
+        let (e, c) = invoke_with_turn("t", "turn-0");
+        l.record_with_context(e, c);
+        assert!(graph.read().unwrap().is_empty());
+
+        // A turn within the cap window is still pending and pairs normally.
+        let last = format!("turn-{}", PENDING_CAP + 9);
+        let (e, c) = invoke_with_turn("t", &last);
+        l.record_with_context(e, c);
+        assert_eq!(graph.read().unwrap().len(), 1);
     }
 
     #[test]
