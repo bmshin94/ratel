@@ -49,19 +49,12 @@
 //! [`IntentGraph::arm`] picks the tier from what the graph carries, so either
 //! kind works on every [`crate::SearchMethod`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::trace::{Origin, TraceEnvelope, TraceEvent, TraceEventContext, TraceSink};
-use crate::usage::{Capability, IntentGraph, NO_TURN, Observation};
-
-/// Cap on concurrently-pending turn keys. Bounds memory from turns that search
-/// and never invoke; eviction is FIFO by first-touch, mirroring
-/// [`crate::usage`]'s own `PENDING_CAP`/`BoundedMap` posture (kept as an
-/// independent constant/type here since the two live in different modules and
-/// hold different value shapes).
-const PENDING_CAP: usize = 256;
+use crate::usage::{BoundedMap, Capability, IntentGraph, NO_TURN, Observation};
 
 /// The most recent search per pending turn — the query an invoke under that
 /// turn attributes to. Kept per-learner (not read from the shared graph) so a
@@ -72,44 +65,6 @@ const PENDING_CAP: usize = 256;
 /// one fanned-out question once between them, not once each.
 struct Pending {
     query: String,
-}
-
-/// Bounded, [`NO_TURN`]-keyed pending map behind [`UsageLearner::pending`].
-/// FIFO-evicts the longest-pending turn key once [`PENDING_CAP`] is exceeded.
-#[derive(Default)]
-struct PendingMap {
-    slots: HashMap<String, Pending>,
-    order: VecDeque<String>,
-}
-
-impl PendingMap {
-    /// Record `query` as the pending search for `turn_key`, replacing whatever
-    /// was pending under that same key.
-    fn remember(&mut self, turn_key: &str, query: &str) {
-        if !self.slots.contains_key(turn_key) {
-            self.order.push_back(turn_key.to_string());
-            while self.slots.len() >= PENDING_CAP {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.slots.remove(&oldest);
-                } else {
-                    break;
-                }
-            }
-        }
-        self.slots.insert(
-            turn_key.to_string(),
-            Pending {
-                query: query.to_string(),
-            },
-        );
-    }
-
-    /// The query pending under `turn_key`, without clearing it — several
-    /// invokes may follow one search under the same turn, and each needs to
-    /// see it.
-    fn query_for(&self, turn_key: &str) -> Option<String> {
-        self.slots.get(turn_key).map(|p| p.query.clone())
-    }
 }
 
 /// Which searches may open an observation window.
@@ -379,7 +334,7 @@ pub struct UsageLearner {
     /// The most recent search per pending turn, awaiting an invoke to confirm
     /// it. Keyed by `turn_id` (see the module doc); callers that never supply
     /// one share [`crate::usage::NO_TURN`].
-    pending: Mutex<PendingMap>,
+    pending: Mutex<BoundedMap<Pending>>,
     policy: ObservationPolicy,
 }
 
@@ -402,7 +357,7 @@ impl UsageLearner {
         Self {
             inner,
             graph,
-            pending: Mutex::new(PendingMap::default()),
+            pending: Mutex::new(BoundedMap::default()),
             policy,
         }
     }
@@ -428,7 +383,12 @@ impl UsageLearner {
     /// then another credit — two real searches, which should count twice.
     fn remember_query(&self, turn_key: &str, query: &str) {
         if let Ok(mut pending) = self.pending.lock() {
-            pending.remember(turn_key, query);
+            pending.insert(
+                turn_key,
+                Pending {
+                    query: query.to_string(),
+                },
+            );
         }
         if let Ok(graph) = self.graph.read() {
             graph.arm_credit(turn_key, query);
@@ -444,7 +404,7 @@ impl UsageLearner {
         let Ok(pending) = self.pending.lock() else {
             return;
         };
-        let Some(query) = pending.query_for(turn_key) else {
+        let Some(query) = pending.get(turn_key).map(|p| p.query.clone()) else {
             return; // an invoke with no search before it proves nothing
         };
         drop(pending);
@@ -536,6 +496,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::trace::{MemorySink, NoopSink, Origin};
+    use crate::usage::PENDING_CAP;
 
     fn learner() -> (Arc<UsageLearner>, Arc<RwLock<IntentGraph>>) {
         let graph = Arc::new(RwLock::new(IntentGraph::empty()));

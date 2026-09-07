@@ -97,24 +97,38 @@ const MEMBER_CAP: usize = 50;
 pub(crate) const NO_TURN: &str = "";
 
 /// Cap on concurrently-pending turn keys held by [`PendingQuery`] / [`CreditSlot`]
-/// (and mirrored by [`crate::UsageLearner`]'s own pending map). Bounds memory
-/// from turns that search but never invoke; eviction is FIFO by first-touch,
-/// the same unsophisticated posture [`MEMBER_CAP`] already uses rather than a
-/// wall-clock TTL.
-const PENDING_CAP: usize = 256;
+/// and by [`crate::UsageLearner`]'s own pending map ([`BoundedMap`] is shared
+/// between them). Bounds memory from turns that search but never invoke;
+/// eviction is FIFO by first-touch, the same unsophisticated posture
+/// [`MEMBER_CAP`] already uses rather than a wall-clock TTL.
+pub(crate) const PENDING_CAP: usize = 256;
 
 /// A small map bounded to [`PENDING_CAP`] entries, evicting the
 /// longest-pending key (FIFO by first insertion) once full. Shared shape
-/// behind [`PendingQuery`] and [`CreditSlot`], which differ only in what they
-/// store per key.
-#[derive(Debug, Default)]
-struct BoundedMap<V> {
+/// behind [`PendingQuery`] and [`CreditSlot`] here, and reused as-is by
+/// [`crate::UsageLearner`]'s own turn-keyed pending map — the three differ
+/// only in what they store per key, which `BoundedMap<V>` doesn't care about.
+#[derive(Debug)]
+pub(crate) struct BoundedMap<V> {
     slots: HashMap<String, V>,
     order: VecDeque<String>,
 }
 
+// Written by hand rather than derived: `#[derive(Default)]` would add a spurious
+// `V: Default` bound (neither field actually needs one — an empty map holds no
+// `V` yet), which would rule out `BoundedMap<Pending>` since `Pending` has no
+// reason to implement `Default` itself.
+impl<V> Default for BoundedMap<V> {
+    fn default() -> Self {
+        Self {
+            slots: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
 impl<V> BoundedMap<V> {
-    fn insert(&mut self, key: &str, value: V) {
+    pub(crate) fn insert(&mut self, key: &str, value: V) {
         if !self.slots.contains_key(key) {
             self.order.push_back(key.to_string());
             while self.slots.len() >= PENDING_CAP {
@@ -128,11 +142,11 @@ impl<V> BoundedMap<V> {
         self.slots.insert(key.to_string(), value);
     }
 
-    fn get(&self, key: &str) -> Option<&V> {
+    pub(crate) fn get(&self, key: &str) -> Option<&V> {
         self.slots.get(key)
     }
 
-    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut V> {
         self.slots.get_mut(key)
     }
 }
