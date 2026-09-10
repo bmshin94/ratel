@@ -147,12 +147,14 @@ impl ObservationPolicy {
 /// What one trace event means for learning, under a policy.
 ///
 /// **The pairing rule, in one place.** The live path and the replay path differ
-/// in which id keys their pending-state map — the live path by `turn_id`, a
-/// replay by `session_id` (see [`replay_log_into`]) — but they must agree
-/// exactly on *which event does what*, or a graph built from a log stops
-/// matching the one live learning would have grown from the same events. Having
-/// written that match twice, a later change (a new confirming event, a pairing
-/// strategy) would have to land in both with nothing forcing the second.
+/// in which id keys their pending-state map — the live path by `turn_id`
+/// alone, a replay by `(session_id, turn_id)` (see [`replay_log_into`]), since
+/// one replayed log can interleave several sessions that a live learner never
+/// sees together — but they must agree exactly on *which event does what*, or
+/// a graph built from a log stops matching the one live learning would have
+/// grown from the same events. Having written that match twice, a later change
+/// (a new confirming event, a pairing strategy) would have to land in both with
+/// nothing forcing the second.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Step<'a> {
     /// This search opens an observation window for `query`.
@@ -186,14 +188,18 @@ pub(crate) fn classify(event: &TraceEvent, policy: ObservationPolicy) -> Step<'_
 }
 
 /// Replay a whole trace log into `graph`, pairing searches with invokes
-/// **per session** while walking the log in its own order.
+/// **per `(session_id, turn_id)`** while walking the log in its own order.
 ///
 /// Both halves of that are load-bearing:
 ///
-/// - **Per-session pending state.** Sessions interleave in one log and share one
+/// - **Per-turn pending state.** Sessions interleave in one log and share one
 ///   graph; feeding them through a single pending slot would cross-pair one
-///   session's search with another's invoke and record edges nobody produced
-///   (the rule the module doc states for [`UsageLearner`] itself).
+///   turn's search with another's invoke and record edges nobody produced (the
+///   rule the module doc states for [`UsageLearner`] itself). A `turn_id` is
+///   what actually separates concurrent callers sharing one `session_id` — the
+///   topology `turn_id` exists for — so it is folded into the key alongside
+///   `session_id`; a log that never sets it falls back to the pre-`turn_id`
+///   per-session behavior.
 /// - **Log order, never re-sorted.** `JsonlSink` appends, so file order *is*
 ///   arrival order — what the live path saw. Sorting by `ts` would produce a
 ///   graph the live path could not have grown, since cluster membership depends
@@ -213,7 +219,8 @@ pub(crate) fn replay_log_into(
     embeddings: &HashMap<String, Vec<f32>>,
     fingerprint: Option<&str>,
 ) {
-    // session id -> (the query its next invoke attributes to, already credited).
+    // (session id, turn key) -> (the query its next invoke attributes to,
+    // already credited).
     //
     // The credit is tracked HERE rather than through [`IntentGraph::arm_credit`]
     // / [`claim_credit`]. That slot is global and keyed by query text, which is
@@ -221,42 +228,52 @@ pub(crate) fn replay_log_into(
     // agree, and identical text from two concurrent sessions is rare. In a
     // replay it is not rare: sessions interleave by construction and popular
     // questions repeat verbatim, so a shared slot loses the second session's
-    // observation every time. Replay knows the session, so it can be exact.
-    let mut pending: HashMap<&str, (&str, bool)> = HashMap::new();
+    // observation every time. Replay knows the session and the turn, so it can
+    // be exact.
+    //
+    // Keying by `session_id` alone reproduced the live path's pre-`turn_id`
+    // bug: this PR's target topology is one sink shared by concurrent app
+    // sessions, so every envelope carries the *same* `session_id` and differs
+    // only by `turn_id`. Adding `turn_id` to the key mirrors what the live path
+    // already does (see the module doc); a log that never sets `turn_id` still
+    // falls back to `NO_TURN` for every envelope, so the per-session key
+    // collapses to exactly what it was before and existing logs replay
+    // unchanged.
+    let mut pending: HashMap<(&str, &str), (&str, bool)> = HashMap::new();
 
     for env in envelopes {
         let session = env.session_id.as_str();
+        let turn_key = env.turn_id.as_deref().unwrap_or(NO_TURN);
+        let key = (session, turn_key);
         let (kind, capability_id) = match classify(&env.event, policy) {
             Step::Remember(query) => {
                 // Re-arming with the same text is idempotent: a capability
                 // search fans one question to both catalogs, and both of those
                 // land before any invoke, so the turn still credits once.
-                pending.insert(session, (query, false));
+                pending.insert(key, (query, false));
                 continue;
             }
             Step::Confirm(kind, id) => (kind, id),
             Step::Ignore => continue,
         };
 
-        let Some(entry) = pending.get_mut(session) else {
+        let Some(entry) = pending.get_mut(&key) else {
             continue; // an invoke with no accepted search before it proves nothing
         };
         let query = entry.0;
-        // The first confirming invoke of THIS session's question is what makes
-        // it an observation; later ones add edges for the same question.
+        // The first confirming invoke of THIS turn's question is what makes it
+        // an observation; later ones add edges for the same question.
         let first_confirmation = !entry.1;
         entry.1 = true;
         // Stash this query's vector right before the observation reads it,
-        // under the shared NO_TURN key: replay walks the log sequentially, one
-        // envelope at a time, so nothing else can clobber it between the set
-        // and this same iteration's read — unlike the live path, replay needs
-        // no turn keying here (it already keys credit/pending by `session` in
-        // the map above, for its own reason: log interleaving).
+        // under this turn's key: replay walks the log sequentially, one
+        // envelope at a time, so nothing else under the same key can clobber it
+        // between the set and this same iteration's read.
         if let (Some(vector), Some(fp)) = (embeddings.get(query), fingerprint) {
-            graph.note_query_vector(NO_TURN, query, vector, fp);
+            graph.note_query_vector(turn_key, query, vector, fp);
         }
         graph.observe(Observation {
-            turn_key: NO_TURN,
+            turn_key,
             query,
             kind,
             capability_id,
@@ -792,6 +809,107 @@ mod tests {
         );
         assert_eq!(
             g.intents[0].tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete", "vault_rotate"],
+            "both invokes cross-paired onto the one pending query, as before"
+        );
+    }
+
+    fn envelope(ts: u64, session: &str, turn_id: Option<&str>, event: TraceEvent) -> TraceEnvelope {
+        TraceEnvelope {
+            v: 2,
+            event_id: String::new(),
+            ts,
+            session_id: session.into(),
+            source_id: String::new(),
+            invocation_id: None,
+            catalog_version: None,
+            environment: None,
+            end_user_id: None,
+            trace_id: None,
+            span_id: None,
+            turn_id: turn_id.map(Into::into),
+            event,
+        }
+    }
+
+    #[test]
+    fn replay_keys_pending_state_by_turn_id_not_just_session_id() {
+        // The exact live-path bug (see `two_concurrent_sessions_with_turn_ids_do_not_cross_pair`
+        // above), reproduced offline: this PR's target topology is one sink shared
+        // by concurrent app sessions, so every envelope carries the SAME
+        // `session_id` and differs only by `turn_id`. If replay keys pending
+        // state by `session_id` alone, session B's search silently overwrites
+        // session A's pending query and A's invoke cross-pairs onto B's question
+        // — the very corruption `turn_id` exists to prevent, reintroduced in the
+        // offline path the live path already fixed.
+        let mut graph = IntentGraph::empty();
+        let log = vec![
+            envelope(1, "s1", Some("turn-a"), search("delete a stale branch")),
+            envelope(2, "s1", Some("turn-b"), search("rotate the signing key")),
+            envelope(3, "s1", Some("turn-a"), invoke("git_branch_delete")),
+            envelope(4, "s1", Some("turn-b"), invoke("vault_rotate")),
+        ];
+
+        replay_log_into(
+            &mut graph,
+            &log,
+            ObservationPolicy::default(),
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(graph.len(), 2, "two distinct questions, two clusters");
+        let a = graph
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"delete a stale branch".to_string()))
+            .expect("turn-a's query should have its own cluster");
+        assert_eq!(
+            a.tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete"],
+            "turn-a's invoke must pair with turn-a's search, not turn-b's"
+        );
+        let b = graph
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"rotate the signing key".to_string()))
+            .expect("turn-b's query should have its own cluster");
+        assert_eq!(
+            b.tools.keys().collect::<Vec<_>>(),
+            vec!["vault_rotate"],
+            "turn-b's invoke must pair with turn-b's search, not turn-a's"
+        );
+    }
+
+    #[test]
+    fn replay_with_no_turn_id_reproduces_todays_single_slot_pairing_exactly() {
+        // Backward-compat proof for the offline path, mirroring the live-path
+        // one above: a log that never sets `turn_id` keeps the pre-`turn_id`
+        // per-session single-slot behavior byte for byte.
+        let mut graph = IntentGraph::empty();
+        let log = vec![
+            envelope(1, "s1", None, search("delete a stale branch")),
+            envelope(2, "s1", None, search("rotate the signing key")),
+            envelope(3, "s1", None, invoke("git_branch_delete")),
+            envelope(4, "s1", None, invoke("vault_rotate")),
+        ];
+
+        replay_log_into(
+            &mut graph,
+            &log,
+            ObservationPolicy::default(),
+            &HashMap::new(),
+            None,
+        );
+
+        assert_eq!(graph.len(), 1, "only the later query was pending");
+        assert!(
+            graph.intents[0]
+                .members
+                .contains(&"rotate the signing key".to_string())
+        );
+        assert_eq!(
+            graph.intents[0].tools.keys().collect::<Vec<_>>(),
             vec!["git_branch_delete", "vault_rotate"],
             "both invokes cross-paired onto the one pending query, as before"
         );
