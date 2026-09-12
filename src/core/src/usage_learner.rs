@@ -16,10 +16,12 @@
 //! invoke(s) that confirm it — distinct from the trace-*stream* `session_id`
 //! fixed at sink construction. A learner shared by multiple concurrent
 //! sessions stays correct as long as each supplies its own `turn_id`. A
-//! caller that never supplies one shares the reserved sentinel slot
-//! ([`crate::usage::NO_TURN`]), reproducing the original single-slot
-//! behavior — including its cross-session collisions — as the accepted cost
-//! of opting out.
+//! caller that never supplies one shares the one `None` slot, reproducing the
+//! original single-slot behavior — including its cross-session collisions —
+//! as the accepted cost of opting out. Because that slot is keyed by `None`
+//! rather than a sentinel *string*, a caller who explicitly supplies an empty
+//! `turn_id` does not collide with it — it gets its own slot, like any other
+//! value.
 //!
 //! # What counts as evidence
 //!
@@ -54,7 +56,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::trace::{Origin, TraceEnvelope, TraceEvent, TraceEventContext, TraceSink};
-use crate::usage::{BoundedMap, Capability, IntentGraph, NO_TURN, Observation};
+use crate::usage::{BoundedMap, Capability, IntentGraph, Observation};
 
 /// The most recent search per pending turn — the query an invoke under that
 /// turn attributes to. Kept per-learner (not read from the shared graph) so a
@@ -236,14 +238,13 @@ pub(crate) fn replay_log_into(
     // sessions, so every envelope carries the *same* `session_id` and differs
     // only by `turn_id`. Adding `turn_id` to the key mirrors what the live path
     // already does (see the module doc); a log that never sets `turn_id` still
-    // falls back to `NO_TURN` for every envelope, so the per-session key
-    // collapses to exactly what it was before and existing logs replay
-    // unchanged.
-    let mut pending: HashMap<(&str, &str), (&str, bool)> = HashMap::new();
+    // resolves to `None` for every envelope, so the per-session key collapses
+    // to exactly what it was before and existing logs replay unchanged.
+    let mut pending: HashMap<(&str, Option<&str>), (&str, bool)> = HashMap::new();
 
     for env in envelopes {
         let session = env.session_id.as_str();
-        let turn_key = env.turn_id.as_deref().unwrap_or(NO_TURN);
+        let turn_key = env.turn_id.as_deref();
         let key = (session, turn_key);
         let (kind, capability_id) = match classify(&env.event, policy) {
             Step::Remember(query) => {
@@ -350,7 +351,7 @@ pub struct UsageLearner {
     graph: Arc<RwLock<IntentGraph>>,
     /// The most recent search per pending turn, awaiting an invoke to confirm
     /// it. Keyed by `turn_id` (see the module doc); callers that never supply
-    /// one share [`crate::usage::NO_TURN`].
+    /// one share the one `None` slot.
     pending: Mutex<BoundedMap<Pending>>,
     policy: ObservationPolicy,
 }
@@ -398,7 +399,7 @@ impl UsageLearner {
     /// its own learner — the previous per-learner flag credited once *each*.
     /// Over-counting still needs a credit, then another search of the same text,
     /// then another credit — two real searches, which should count twice.
-    fn remember_query(&self, turn_key: &str, query: &str) {
+    fn remember_query(&self, turn_key: Option<&str>, query: &str) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(
                 turn_key,
@@ -417,7 +418,7 @@ impl UsageLearner {
     /// Best-effort throughout: trace events are observations, so a poisoned lock
     /// or a missing pending query drops the evidence rather than disturbing the
     /// agent loop (ADR-0007's query-log semantics).
-    fn confirm(&self, turn_key: &str, kind: Capability, capability_id: &str, ts_ms: u64) {
+    fn confirm(&self, turn_key: Option<&str>, kind: Capability, capability_id: &str, ts_ms: u64) {
         let Ok(pending) = self.pending.lock() else {
             return;
         };
@@ -458,7 +459,7 @@ impl UsageLearner {
     /// supplies its own `turn_id` (see the module doc); envelopes carry
     /// `turn_id` themselves, so no extra plumbing is needed here.
     pub fn replay(&self, envelope: &TraceEnvelope) {
-        let turn_key = envelope.turn_id.as_deref().unwrap_or(NO_TURN);
+        let turn_key = envelope.turn_id.as_deref();
         self.learn_from(&envelope.event, envelope.ts, turn_key);
     }
 
@@ -468,7 +469,7 @@ impl UsageLearner {
     /// cleared**. Clearing would let one of Ratel's own internal searches,
     /// landing between a captured query and its invokes, silently discard the
     /// turn's evidence.
-    fn learn_from(&self, event: &TraceEvent, ts_ms: u64, turn_key: &str) {
+    fn learn_from(&self, event: &TraceEvent, ts_ms: u64, turn_key: Option<&str>) {
         match classify(event, self.policy) {
             Step::Remember(query) => self.remember_query(turn_key, query),
             Step::Confirm(kind, capability_id) => {
@@ -481,18 +482,18 @@ impl UsageLearner {
 
 impl TraceSink for UsageLearner {
     fn record(&self, event: TraceEvent) {
-        self.learn_from(&event, now_ms(), NO_TURN);
+        self.learn_from(&event, now_ms(), None);
         self.inner.record(event);
     }
 
     fn record_with_context(&self, event: TraceEvent, context: TraceEventContext) {
-        let turn_key = context.turn_id.as_deref().unwrap_or(NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         self.learn_from(&event, now_ms(), turn_key);
         self.inner.record_with_context(event, context);
     }
 
     fn record_envelope(&self, envelope: TraceEnvelope) {
-        let turn_key = envelope.turn_id.as_deref().unwrap_or(NO_TURN);
+        let turn_key = envelope.turn_id.as_deref();
         self.learn_from(&envelope.event, envelope.ts, turn_key);
         self.inner.record_envelope(envelope);
     }
@@ -786,6 +787,46 @@ mod tests {
             b.tools.keys().collect::<Vec<_>>(),
             vec!["vault_rotate"],
             "session B's invoke must pair with session B's search, not A's"
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_turn_id_does_not_share_the_slot_of_a_caller_who_never_opted_in() {
+        // Review comment #4's exact scenario, end to end through the live
+        // learner: caller A supplies `turn_id: Some("")` (e.g. a session id
+        // that resolved to an empty string) believing it opted in; caller B
+        // never supplies one at all (`None`). Interleaved, A's invoke must not
+        // land on B's question just because both keys used to collapse to the
+        // same string sentinel.
+        let (l, graph) = learner();
+        let (e, c) = search_with_turn("rotate the signing key", "");
+        l.record_with_context(e, c);
+        l.record(search("delete a stale branch")); // caller B: no turn_id at all
+        let (e, c) = invoke_with_turn("vault_rotate", "");
+        l.record_with_context(e, c);
+        l.record(invoke("git_branch_delete"));
+
+        let g = graph.read().unwrap();
+        assert_eq!(g.len(), 2, "two distinct questions, two clusters");
+        let a = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"rotate the signing key".to_string()))
+            .expect("caller A's (Some(\"\")) query should have its own cluster");
+        assert_eq!(
+            a.tools.keys().collect::<Vec<_>>(),
+            vec!["vault_rotate"],
+            "caller A's invoke must pair with caller A's search, not B's"
+        );
+        let b = g
+            .intents
+            .iter()
+            .find(|i| i.members.contains(&"delete a stale branch".to_string()))
+            .expect("caller B's (None) query should have its own cluster");
+        assert_eq!(
+            b.tools.keys().collect::<Vec<_>>(),
+            vec!["git_branch_delete"],
+            "caller B's invoke must pair with caller B's search, not A's"
         );
     }
 

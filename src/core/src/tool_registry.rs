@@ -414,7 +414,7 @@ impl ToolRegistry {
     /// exactly as before.
     fn usage_arm(
         &self,
-        turn_key: &str,
+        turn_key: Option<&str>,
         query: &str,
         query_vec: Option<&[f32]>,
     ) -> Option<UsageArm> {
@@ -798,7 +798,7 @@ impl ToolRegistry {
         context: TraceEventContext,
     ) -> Vec<SearchHit> {
         let started = Instant::now();
-        let turn_key = context.turn_id.as_deref().unwrap_or(crate::usage::NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         let t = Instant::now();
         let arm = self.usage_arm(turn_key, query, None);
         let usage_ms = t.elapsed().as_millis() as u64;
@@ -884,7 +884,7 @@ impl ToolRegistry {
 
         // Reuses the vector the dense arm just embedded — no second inference.
         let t = Instant::now();
-        let turn_key = context.turn_id.as_deref().unwrap_or(crate::usage::NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         let arm = self.usage_arm(turn_key, query, Some(&query_vec));
         let usage_ms = t.elapsed().as_millis() as u64;
 
@@ -979,7 +979,7 @@ impl ToolRegistry {
         // 3. Usage (ADR-0014), matched on the vector the dense arm already
         //    embedded. Absent unless a graph is attached and the query matches.
         let t = Instant::now();
-        let turn_key = context.turn_id.as_deref().unwrap_or(crate::usage::NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         let arm = self.usage_arm(turn_key, query, Some(&query_vec));
         let usage_ms = t.elapsed().as_millis() as u64;
 
@@ -1803,15 +1803,10 @@ mod tests {
         // Keying it by query text means the mismatch degrades to lexical
         // clustering rather than attaching the wrong embedding to a question.
         let graph = IntentGraph::empty();
-        graph.note_query_vector(
-            crate::usage::NO_TURN,
-            "some other query",
-            &[1.0, 0.0, 0.0],
-            "m",
-        );
+        graph.note_query_vector(None, "some other query", &[1.0, 0.0, 0.0], "m");
         let mut graph = graph;
         graph.observe(crate::usage::Observation {
-            turn_key: crate::usage::NO_TURN,
+            turn_key: None,
             query: "delete a path",
             kind: Capability::Tool,
             capability_id: "delete_file",

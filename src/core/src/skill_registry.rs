@@ -272,7 +272,7 @@ impl SkillRegistry {
     /// `ToolRegistry::usage_arm`; this reads the `skills` edge map instead.
     fn usage_arm(
         &self,
-        turn_key: &str,
+        turn_key: Option<&str>,
         query: &str,
         query_vec: Option<&[f32]>,
     ) -> Option<UsageArm> {
@@ -709,7 +709,7 @@ impl SkillRegistry {
         context: TraceEventContext,
     ) -> Vec<SkillHit> {
         let started = Instant::now();
-        let turn_key = context.turn_id.as_deref().unwrap_or(crate::usage::NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         let t = Instant::now();
         let arm = self.usage_arm(turn_key, query, None);
         let usage_ms = t.elapsed().as_millis() as u64;
@@ -792,7 +792,7 @@ impl SkillRegistry {
 
         // Reuses the vector the dense arm just embedded — no second inference.
         let t = Instant::now();
-        let turn_key = context.turn_id.as_deref().unwrap_or(crate::usage::NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         let arm = self.usage_arm(turn_key, query, Some(&query_vec));
         let usage_ms = t.elapsed().as_millis() as u64;
 
@@ -879,7 +879,7 @@ impl SkillRegistry {
 
         // Usage arm, matched on the vector the dense arm already embedded.
         let t = Instant::now();
-        let turn_key = context.turn_id.as_deref().unwrap_or(crate::usage::NO_TURN);
+        let turn_key = context.turn_id.as_deref();
         let arm = self.usage_arm(turn_key, query, Some(&query_vec));
         let usage_ms = t.elapsed().as_millis() as u64;
 
