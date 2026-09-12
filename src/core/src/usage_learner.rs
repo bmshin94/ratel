@@ -308,11 +308,15 @@ pub(crate) fn replay_log_into(
                 kind,
                 surfaced,
             } => {
-                // Re-arming with the same text is idempotent: a capability
-                // search fans one question to both catalogs, and both land
-                // before any invoke, so the turn still credits once. Each fills
-                // its OWN slot — one slot would let the skill search's ids
-                // overwrite the tool search's and land in the wrong map.
+                // Every search re-arms credit, matching `CreditSlot::arm` being
+                // called unconditionally on the live path: a session that
+                // re-searches the same text after already invoking must be able
+                // to credit again. Re-arming with the same text is otherwise
+                // idempotent — a capability search fans one question to both
+                // catalogs, and both land before any invoke, so the turn still
+                // credits once. Each fills its OWN slot — one slot would let the
+                // skill search's ids overwrite the tool search's and land in the
+                // wrong map.
                 let entry = pending.entry(session).or_default();
                 if entry.query != query {
                     *entry = Window {
@@ -320,6 +324,7 @@ pub(crate) fn replay_log_into(
                         ..Window::default()
                     };
                 }
+                entry.credited = false;
                 match kind {
                     Capability::Tool => entry.tools = (surfaced, false),
                     Capability::Skill => entry.skills = (surfaced, false),
@@ -1089,6 +1094,11 @@ mod tests {
         assert_eq!(
             offline.intents[0].surfaced_tools.get("docker_build"),
             Some(&2)
+        );
+        assert_eq!(
+            offline.intents[0].support,
+            live.read().unwrap().intents[0].support,
+            "replay must credit the same number of observations as live learning"
         );
     }
 
