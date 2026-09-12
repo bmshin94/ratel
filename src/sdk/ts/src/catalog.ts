@@ -32,11 +32,15 @@ import {
  * {@link ToolCatalog.invokeRaw} preserves the immediate return shape when
  * validation is synchronous, while {@link ToolCatalog.invokeValidatedRaw}
  * guarantees that shape after a host has already validated the input.
- * One-argument executors remain valid; framework-neutral callers normally omit
- * `context`.
+ * One- and two-argument executors remain valid; framework-neutral callers
+ * normally omit `context` and `turnId`.
  */
-// biome-ignore lint/suspicious/noExplicitAny: tool inputs are heterogeneous across the catalog
-export type Executor = (input: any, context?: unknown) => Promise<unknown> | unknown;
+export type Executor = (
+  // biome-ignore lint/suspicious/noExplicitAny: tool inputs are heterogeneous across the catalog
+  input: any,
+  context?: unknown,
+  turnId?: string,
+) => Promise<unknown> | unknown;
 
 /** Result returned by a framework-native input validator. */
 export type InputValidationResult =

@@ -38,11 +38,14 @@ from .telemetry import (
     trace_search_async,
 )
 
-Executor = Callable[[dict[str, Any]], Union[Awaitable[Any], Any]]
+Executor = Callable[..., Union[Awaitable[Any], Any]]
 """A tool handler: takes the tool's arguments dict, returns the result.
 
 May be sync or async (tool inputs are heterogeneous across the catalog);
-`ToolCatalog.invoke` absorbs the difference.
+`ToolCatalog.invoke` absorbs the difference. `Callable[..., ...]` rather than a
+precise arity because the capability-tool builders' own executors additionally
+take an optional trailing `turn_id: str | None` (correlating a search with the
+invoke(s) that confirm it, ADR-0014) that `Callable` cannot express as optional.
 """
 
 SearchOrigin = str
