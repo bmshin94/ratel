@@ -181,7 +181,12 @@ fn one_u32() -> u32 {
 }
 
 fn is_one_u32(n: &u32) -> bool {
-    *n == 1
+    // `0` is a lexical-only cluster (no vector ever folded), which the wire
+    // schema forbids (`vector_n` has a minimum of 1). Absent already decodes
+    // to `1`, so folding `0` into the same omission is lossless: nothing reads
+    // `vector_n` without `mean`/`centroid` also being set, and a lexical
+    // cluster has neither.
+    *n <= 1
 }
 
 /// Pseudo-counts smoothing [`Intent::passed_over`]. Large enough that one
@@ -887,7 +892,12 @@ impl Intent {
             }
         }
         let mean = self.mean.clone().expect("set on both arms above");
-        self.cohesion = norm(&mean);
+        // `.min(1.0)`: f32 rounding in the incremental update above can drift
+        // the computed norm a hair past the mathematical ceiling of 1.0 for a
+        // mean of unit vectors — `IntentGraph::validate` rejects anything
+        // outside `(0, 1]`, so an unclamped value here can produce a graph
+        // this same code refuses to load back.
+        self.cohesion = norm(&mean).min(1.0);
         self.centroid = Some(normalize(mean));
     }
 
@@ -1649,7 +1659,9 @@ impl IntentGraph {
                 *s /= folded as f32;
             }
             let it = &mut self.intents[i];
-            it.cohesion = norm(&sum);
+            // `.min(1.0)`: same f32-rounding guard as `absorb_vector` — the
+            // batch mean here can drift past 1.0 for the same reason.
+            it.cohesion = norm(&sum).min(1.0);
             it.centroid = Some(normalize(sum.clone()));
             // Keep the per-member vectors, not just their mean. They are what
             // `coverage` counts, they never cross the wire, and this is the only
@@ -4326,6 +4338,82 @@ mod tests {
         let json = r#"{"v":1,"built_from_ts":1,"intents":[{"id":"i0","label":"q","terms":[],
                        "members":["q"],"support":1,"tools":{},"skills":{},"cohesion":0.5}]}"#;
         assert!(IntentGraph::from_json(json).is_err());
+    }
+
+    /// A base direction folded repeatedly with a tiny, changing wobble: every
+    /// vector is still unit length, but no two folds are bit-identical, which
+    /// is what lets f32 rounding in the incremental mean drift rather than
+    /// cancel out exactly.
+    fn near_identical_unit_vectors(n: u32) -> Vec<Vec<f32>> {
+        let base = normalize(vec![1.0, 2.0, 3.0, 0.5]);
+        let wobble = 3e-7;
+        (0..n)
+            .map(|i| {
+                let mut v = base.clone();
+                for (j, x) in v.iter_mut().enumerate() {
+                    let h = (i.wrapping_mul(2654435761).wrapping_add(j as u32 * 40503)) as i64;
+                    let n = ((h % 2000) - 1000) as f32 / 1000.0;
+                    *x += n * wobble;
+                }
+                normalize(v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn absorbing_near_identical_vectors_does_not_push_cohesion_above_one() {
+        // f32 rounding in `absorb_vector`'s incremental mean can nudge
+        // `norm(&mean)` a hair past 1.0 — reproduced upstream as `cohesion
+        // 1.0000002 outside (0, 1]`, which `IntentGraph::from_json` then
+        // rejects on the very graph that produced it.
+        let mut it = intent("i0", &["a"], &[("t", 1.0)]);
+        for v in near_identical_unit_vectors(200) {
+            it.absorb_vector(&v);
+        }
+        it.last_ts = T0;
+        assert!(it.cohesion <= 1.0, "cohesion {} exceeds 1.0", it.cohesion);
+
+        let g = graph(vec![it]);
+        let json = serde_json::to_string(&g).unwrap();
+        let back = IntentGraph::from_json(&json);
+        assert!(back.is_ok(), "graph failed to reload: {back:?}");
+        assert!(back.unwrap().intents[0].cohesion <= 1.0);
+    }
+
+    #[test]
+    fn rebuilding_centroids_from_near_identical_vectors_does_not_push_cohesion_above_one() {
+        // Same drift, the batch-mean path in `rebuild_centroids`.
+        let vectors = near_identical_unit_vectors(200);
+        let mut g = graph(vec![intent("i0", &["a"], &[("t", 1.0)])]);
+        g.rebuild_centroids(vec![("i0".into(), vectors)], "m".into());
+        assert!(
+            g.intents[0].cohesion <= 1.0,
+            "cohesion {} exceeds 1.0",
+            g.intents[0].cohesion
+        );
+    }
+
+    #[test]
+    fn a_lexical_only_cluster_does_not_serialize_vector_n() {
+        // A cluster that only ever gained members lexically (no vector ever
+        // folded) carries `vector_n == 0` internally. The wire schema requires
+        // `vector_n >= 1`, so a value the schema forbids must never be written.
+        let mut g = IntentGraph::empty();
+        g.observe_live("build broken", Capability::Tool, "a", T0, true);
+
+        assert_eq!(
+            g.intents[0].vector_n, 0,
+            "sanity: this cluster is lexical-only"
+        );
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(!json.contains("vector_n"), "unexpected vector_n in {json}");
+
+        // `rebuild_caches` runs `restore_accumulator` on load, which resets a
+        // centroid-less intent back to `vector_n == 0` regardless of what
+        // deserialization defaulted the absent field to — so the round trip
+        // preserves the lexical cluster's own semantics, not the wire default.
+        let back = IntentGraph::from_json(&json).unwrap();
+        assert_eq!(back.intents[0].vector_n, 0, "still lexical after reload");
     }
 
     // ---- the cluster policy -------------------------------------------------
