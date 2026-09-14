@@ -109,6 +109,20 @@ fn tokenizer() -> DefaultTokenizer {
     DefaultTokenizer::new(Language::English)
 }
 
+/// A query's distinct terms — tokenized and stemmed exactly like a document,
+/// then deduplicated. Shared by [`Bm25Index::search`] and
+/// [`Bm25Index::query_ceiling`] so the two can never again disagree about how
+/// many times a repeated term counts: the engine scores every *occurrence* of
+/// a query term, but the ceiling counts each distinct term once, and feeding
+/// both the same term set is what keeps a repeated word from inflating a score
+/// without inflating what it is normalized against.
+fn distinct_terms(query: &str) -> Vec<String> {
+    let mut terms = tokenizer().tokenize(query);
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+}
+
 impl Bm25Index {
     /// [`Self::build_with`] at the shipped [`Bm25Params::default`]. Production
     /// always goes through [`Bm25Cache`], which reads the registry's current
@@ -191,10 +205,7 @@ impl Bm25Index {
         if n == 0.0 {
             return 0.0;
         }
-        let mut terms = tokenizer().tokenize(query);
-        terms.sort_unstable();
-        terms.dedup();
-        terms
+        distinct_terms(query)
             .iter()
             .map(|t| {
                 let df = self.df.get(t).copied().unwrap_or(0) as f32;
@@ -209,6 +220,14 @@ impl Bm25Index {
         let Some(engine) = &self.engine else {
             return Vec::new();
         };
+        // Deduped before it reaches the engine: the engine scores every
+        // occurrence of a repeated term, but `query_ceiling` (above) counts
+        // each distinct term once — feeding it the same term set the ceiling
+        // uses is what keeps a repeated word from inflating the score without
+        // inflating what it is normalized against. Word order does not affect
+        // BM25 (`Scorer::score_` just accumulates per-term contributions), so
+        // this changes nothing for a query with no repeats.
+        let deduped_query = distinct_terms(query).join(" ");
         // Rank against the full corpus, then truncate — never let the engine
         // cut to `top_k` itself. The bm25 crate sorts by score alone and
         // collects candidates through a HashSet, so equal scores fall back to
@@ -218,7 +237,7 @@ impl Bm25Index {
         // so both the tool and skill buckets are stable. (Centralizes #63,
         // which originally fixed only the tool path in ToolRegistry::search.)
         let mut ranked: Vec<(String, f32)> = engine
-            .search(query, self.doc_count)
+            .search(&deduped_query, self.doc_count)
             .into_iter()
             .map(|r| (r.document.id, r.score))
             .collect();
@@ -323,6 +342,84 @@ mod tests {
                 "read a file from disk with an absolute path".to_string(),
             ),
         ]
+    }
+
+    /// The bug this guards against: the scorer counted every occurrence of a
+    /// repeated query term, while `query_ceiling` counted each distinct term
+    /// once — so a repeated word inflated a raw score without inflating the
+    /// ceiling it is normalized against.
+    #[test]
+    fn a_repeated_query_term_does_not_inflate_the_score() {
+        let docs = vec![
+            ("a".to_string(), "build the app".to_string()),
+            ("b".to_string(), "deploy to prod".to_string()),
+        ];
+        let once = Bm25Index::build(docs.clone()).search("build", 5);
+        let twice = Bm25Index::build(docs).search("build build", 5);
+        assert_eq!(
+            once, twice,
+            "a repeated query term must not inflate the score"
+        );
+    }
+
+    #[test]
+    fn a_repeated_query_term_does_not_change_its_own_ceiling_ratio() {
+        let docs = vec![
+            ("a".to_string(), "build the app".to_string()),
+            ("b".to_string(), "deploy to prod".to_string()),
+        ];
+        let index = Bm25Index::build(docs);
+        let (once_score, twice_score) = (
+            index.search("build", 1)[0].1,
+            index.search("build build", 1)[0].1,
+        );
+        let (once_ceiling, twice_ceiling) = (
+            index.query_ceiling("build"),
+            index.query_ceiling("build build"),
+        );
+        assert!(
+            (once_score / once_ceiling - twice_score / twice_ceiling).abs() < 1e-6,
+            "ratio must agree regardless of how many times the term repeats in the query"
+        );
+    }
+
+    /// Guards against over-correcting: this only dedupes the *query*.
+    /// `build_with` still indexes documents normally, so a document that
+    /// genuinely repeats a word keeps BM25's ordinary term-frequency boost.
+    #[test]
+    fn document_side_repetition_still_gets_its_term_frequency_boost() {
+        let docs = vec![
+            ("once".to_string(), "build the app".to_string()),
+            (
+                "twice".to_string(),
+                "build build the app entirely from scratch".to_string(),
+            ),
+        ];
+        let index = Bm25Index::build(docs);
+        let hits = index.search("build", 2);
+        let score = |id: &str| hits.iter().find(|(h, _)| h == id).unwrap().1;
+        assert!(
+            score("twice") > score("once"),
+            "a document repeating the query term should still score higher"
+        );
+    }
+
+    /// Pins the assumption the query-side dedup relies on: joining an
+    /// already-tokenized/stemmed term list back into a string and tokenizing
+    /// it again reproduces the same terms. If a future tokenizer/stemmer
+    /// change breaks this, it must fail here rather than silently corrupt
+    /// scores.
+    #[test]
+    fn re_tokenizing_already_stemmed_terms_is_a_no_op() {
+        for q in [
+            "build build the app",
+            "send a notification message",
+            "read a file",
+        ] {
+            let once = tokenizer().tokenize(q);
+            let twice = tokenizer().tokenize(&once.join(" "));
+            assert_eq!(once, twice, "stemming is not idempotent for {q:?}");
+        }
     }
 
     #[test]
