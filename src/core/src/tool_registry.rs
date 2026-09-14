@@ -520,7 +520,7 @@ impl ToolRegistry {
         } else {
             let (v, fp) = self
                 .dense
-                .embed_texts_with_identity(&texts, self.sink.as_ref())?;
+                .embed_queries_with_identity(&texts, self.sink.as_ref())?;
             (v, Some(fp))
         };
         let embeddings: HashMap<String, Vec<f32>> = texts.into_iter().zip(vectors).collect();
@@ -2762,6 +2762,28 @@ mod tests {
             centroid,
             SidedEmbedder::QUERY.to_vec(),
             "members must be re-embedded query-side, got {centroid:?}"
+        );
+    }
+
+    #[test]
+    fn seeding_embeds_queries_as_queries_not_documents() {
+        // The seeding twin of `rebuild_embeds_graph_members_as_queries_not_documents`:
+        // a replayed log's queries must land in the same query-side manifold live
+        // learning would put them in, not the document-side one.
+        let reg = catalog(Arc::new(SidedEmbedder));
+        let log = vec![
+            env(1, "s1", baseline_search("read a file")),
+            env(2, "s1", started("read_file")),
+        ];
+
+        let graph = reg
+            .build_intent_graph(log, seeding_policy())
+            .expect("stub embedder never fails");
+
+        assert_eq!(
+            graph.intents[0].centroid.clone().unwrap(),
+            SidedEmbedder::QUERY.to_vec(),
+            "seeded queries must be embedded query-side, not document-side"
         );
     }
 
